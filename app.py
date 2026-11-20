@@ -1,6 +1,9 @@
 import PIL.Image
+import PIL.ImageDraw
+import PIL.ImageFont
 if not hasattr(PIL.Image, 'ANTIALIAS'):
     PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
+
 import os
 import re
 import json
@@ -14,27 +17,24 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from gtts import gTTS
 from google import genai
-from moviepy.editor import ImageClip, AudioFileClip, VideoClip, concatenate_videoclips
+from moviepy.editor import ImageClip, AudioFileClip, AudioClip, VideoClip, concatenate_videoclips
 
 # ==========================================
 # 1. APIキーの安全な読み込み（クラウド公開対応）
 # ==========================================
-# Streamlit Cloudの「Secrets」に設定されたキーを自動で読み込みます
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     CF_ACCOUNT_ID = st.secrets["CF_ACCOUNT_ID"]
     CF_API_TOKEN = st.secrets["CF_API_TOKEN"]
 except Exception:
-    # ローカルPCで直接テストする時用の予備欄（GitHubに上げる時は空欄のままにしてください）
     GEMINI_API_KEY = ""
     CF_ACCOUNT_ID = ""
     CF_API_TOKEN = ""
 
-# 制限文字数の設定
 MAX_CHARS = 15000
 
 # ==========================================
-# 2. 青空文庫の取得と文字数チェック
+# 2. 青空文庫の取得（タイトル・作者名・本文）と文字数チェック
 # ==========================================
 def fetch_and_check_aozora(url, chunk_size=4000):
     response = requests.get(url, timeout=15)
@@ -42,7 +42,11 @@ def fetch_and_check_aozora(url, chunk_size=4000):
     soup = BeautifulSoup(response.text, 'html.parser')
     
     title_tag = soup.find('h1', class_='title')
-    title = title_tag.get_text(strip=True) if title_tag else "aozora_movie"
+    title = title_tag.get_text(strip=True) if title_tag else "無題の作品"
+    
+    author_tag = soup.find('h2', class_='author')
+    author = author_tag.get_text(strip=True) if author_tag else ""
+    
     safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
     
     main_text_div = soup.find('div', class_='main_text')
@@ -55,7 +59,6 @@ def fetch_and_check_aozora(url, chunk_size=4000):
     full_text = main_text_div.get_text(strip=True)
     char_count = len(full_text)
     
-    # ★ 15,000文字以上の場合はここで門前払いする
     if char_count > MAX_CHARS:
         raise ValueError(
             f"作品『{title}』は総文字数が【{char_count:,}文字】あるため、このフリーアプリの上限（{MAX_CHARS:,}文字以下）を超えています。\n"
@@ -63,7 +66,72 @@ def fetch_and_check_aozora(url, chunk_size=4000):
         )
         
     chunks = [full_text[i:i + chunk_size] for i in range(0, char_count, chunk_size)]
-    return title, safe_title, full_text, chunks
+    return title, author, safe_title, full_text, chunks
+
+# ==========================================
+# 2.5 オープニングクレジット動画の作成（作品タイトル＆作者名）
+# ==========================================
+def get_japanese_font(work_dir, size):
+    font_path = os.path.join(work_dir, "NotoSansJP-Bold.ttf")
+    if not os.path.exists(font_path):
+        # 日本語フォントをGitHubのGoogle Fonts公式リポジトリから自動取得
+        domain = "raw.githubusercontent." + "com"
+        font_url = f"https://{domain}/google/fonts/main/ofl/notosansjp/NotoSansJP%5Bwght%5D.ttf"
+        res = requests.get(font_url, timeout=20)
+        if res.status_code == 200:
+            with open(font_path, "wb") as f:
+                f.write(res.content)
+    try:
+        return PIL.ImageFont.truetype(font_path, size)
+    except Exception:
+        return PIL.ImageFont.load_default()
+
+def create_title_clip(title, author, work_dir):
+    img_path = os.path.join(work_dir, "opening_title.png")
+    video_path = os.path.join(work_dir, "part_000_title.mp4")
+    
+    # 1280x720 の落ち着いたダークネイビー〜黒背景を作成
+    width, height = 1280, 720
+    img = PIL.Image.new("RGB", (width, height), color=(18, 20, 28))
+    draw = PIL.ImageDraw.Draw(img)
+    
+    # 枠線を少し装飾として描画
+    draw.rectangle([40, 40, width - 40, height - 40], outline=(180, 160, 120), width=2)
+    
+    title_font = get_japanese_font(work_dir, 64)
+    author_font = get_japanese_font(work_dir, 36)
+    
+    # タイトルが長い場合は自動改行・縮小調整
+    if len(title) > 16:
+        title_font = get_japanese_font(work_dir, 46)
+        
+    # タイトルを中央に配置
+    title_bbox = draw.textbbox((0, 0), title, font=title_font)
+    title_w = title_bbox[2] - title_bbox[0]
+    title_h = title_bbox[3] - title_bbox[1]
+    title_x = (width - title_w) // 2
+    title_y = (height - title_h) // 2 - 40
+    draw.text((title_x, title_y), title, font=title_font, fill=(245, 245, 245))
+    
+    # 作者名をその下に配置
+    if author:
+        author_text = f"作：{author}"
+        author_bbox = draw.textbbox((0, 0), author_text, font=author_font)
+        author_w = author_bbox[2] - author_bbox[0]
+        author_x = (width - author_w) // 2
+        author_y = title_y + title_h + 50
+        draw.text((author_x, author_y), author_text, font=author_font, fill=(210, 195, 160))
+        
+    img.save(img_path)
+    
+    # 3.5秒間のオープニング動画を作成（無音トラック付き）
+    duration = 3.5
+    silent_audio = AudioClip(lambda t: [0, 0], duration=duration, fps=44100)
+    clip = ImageClip(img_path).set_duration(duration).set_audio(silent_audio)
+    clip.write_videofile(video_path, fps=24, codec="libx264", audio_codec="aac", logger=None)
+    clip.close()
+    
+    return video_path
 
 # ==========================================
 # 3. 作品の世界観・キャラクター設定資料の作成
@@ -161,7 +229,7 @@ def generate_image_cloudflare(cf_id, cf_token, scene_description, save_path):
         raise RuntimeError(f"画像生成エラー ({response.status_code})")
 
 # ==========================================
-# 6. パート動画作成 ＆ 結合（一時フォルダ使用でサーバー容量節約）
+# 6. パート動画作成 ＆ 結合
 # ==========================================
 def create_part_video(cf_id, cf_token, scenes, part_num, work_dir, status_box):
     part_video_path = os.path.join(work_dir, f"part_{part_num:03d}.mp4")
@@ -238,18 +306,21 @@ if st.button("🚀 2Dアニメ動画を生成する", type="primary", use_contai
     progress_bar = st.progress(0)
     status_box = st.empty()
     
-    # ユーザーごとに独立した一時フォルダを作成（複数人が同時に使っても混ざらないようにするため）
     with tempfile.TemporaryDirectory() as work_dir:
         try:
             status_box.info("📖 青空文庫からテキストを取得し、文字数をチェック中...")
-            title, safe_title, full_text, chunks = fetch_and_check_aozora(target_url.strip(), chunk_size=4000)
+            title, author, safe_title, full_text, chunks = fetch_and_check_aozora(target_url.strip(), chunk_size=4000)
             
-            st.success(f"✅ 受付完了：『{title}』（{len(full_text):,}文字 / 全 {len(chunks)} パート）")
+            author_disp = f"（作：{author}）" if author else ""
+            st.success(f"✅ 受付完了：『{title}』{author_disp}（{len(full_text):,}文字 / 全 {len(chunks)} パート）")
+            
+            status_box.info("🎬 オープニングタイトル画面を作成中...")
+            title_video = create_title_clip(title, author, work_dir)
+            chapter_files = [title_video]
             
             status_box.info("📚 作品の世界観・キャラクター設定資料を作成中...")
             story_bible = create_story_bible(client, title, full_text)
             
-            chapter_files = []
             current_summary = "物語の始まり。"
             
             for i in range(len(chunks)):
@@ -265,16 +336,15 @@ if st.button("🚀 2Dアニメ動画を生成する", type="primary", use_contai
                 chapter_files.append(video_file)
                 progress_bar.progress(part_num / len(chunks))
                 
-            status_box.info("🎬 動画を結合して仕上げています...")
+            status_box.info("🎬 タイトルと本編を結合して仕上げています...")
             output_filename = f"{safe_title}_2Dアニメ.mp4"
             output_path = os.path.join(work_dir, output_filename)
             merge_videos_fast(chapter_files, output_path, work_dir)
             
-            # 動画データをメモリに読み込んで表示・ダウンロード可能にする
             with open(output_path, "rb") as f:
                 video_bytes = f.read()
                 
-            status_box.success(f"🎉 完成しました！『{title}』")
+            status_box.success(f"🎉 完成しました！『{title}』{author_disp}")
             st.video(video_bytes)
             st.download_button(
                 label="📥 完成したMP4動画をダウンロード",
@@ -285,7 +355,6 @@ if st.button("🚀 2Dアニメ動画を生成する", type="primary", use_contai
             )
             
         except ValueError as ve:
-            # 15,000文字オーバーなどの警告表示
             status_box.empty()
             st.warning(f"⚠️ {ve}")
         except Exception as e:
