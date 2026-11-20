@@ -5,4 +5,3 @@ gTTS
 google-genai
 moviepy==1.0.3
 imageio-ffmpeg
-pillow==9.5.0
