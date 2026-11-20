@@ -1,4 +1,6 @@
-import os
+import PIL.Image
+if not hasattr(PIL.Image, 'ANTIALIAS'):
+    PIL.Image.ANTIALIAS = PIL.Image.LANCZOSimport os
 import re
 import json
 import time
