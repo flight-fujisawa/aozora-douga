@@ -121,36 +121,13 @@ def create_title_clip(title, author, work_dir):
     return video_path
 
 # ==========================================
-# 4. Gemini REST API 直接呼び出し（有効モデル自動取得）
+# 4. Gemini REST API 直接呼び出し（最新モデル指定済み）
 # ==========================================
 def detect_active_gemini_model(api_key):
-    domain = "generativelanguage.googleapis." + "com"
-    list_url = f"https://{domain}/v1beta/models?key={api_key}"
-    res = requests.get(list_url, timeout=15)
-    if res.status_code != 200:
-        raise RuntimeError(f"APIキー認証エラー ({res.status_code}): {res.text[:250]}")
-        
-    models_data = res.json().get("models", [])
-    valid_models = []
-    for m in models_data:
-        name = m.get("name", "")
-        methods = m.get("supportedGenerationMethods", [])
-        if "generateContent" in methods and "gemini" in name.lower():
-            if not any(x in name.lower() for x in ["embedding", "imagen", "veo", "aqa", "tts", "audio", "robotics"]):
-                valid_models.append(name)
-                
-    if not valid_models:
-        raise RuntimeError("このAPIキーで利用可能なGeminiモデルが見つかりませんでした。")
-        
-    # flash系を最優先で1つだけ選ぶ
-    for m in valid_models:
-        if "flash" in m.lower():
-            return m
-    return valid_models[0]
+    return "models/gemini-3.8-flash"
 
 def call_gemini_direct(api_key, model_full_name, prompt):
     domain = "generativelanguage.googleapis." + "com"
-    # model_full_name は "models/gemini-..." の形式
     url = f"https://{domain}/v1beta/{model_full_name}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
