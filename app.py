@@ -9,8 +9,7 @@ import re
 import json
 import time
 import base64
-import hashlib
-import threading
+import tempfile
 import subprocess
 import requests
 import imageio_ffmpeg
@@ -33,13 +32,11 @@ except Exception:
     CF_API_TOKEN = ""
 
 MAX_CHARS = 15000
-BASE_CACHE_DIR = "aozora_video_cache"
-os.makedirs(BASE_CACHE_DIR, exist_ok=True)
 
 # ==========================================
 # 2. 青空文庫の取得と文字数チェック
 # ==========================================
-def fetch_and_check_aozora(url, chunk_size=4000):
+def fetch_and_check_aozora(url, chunk_size=7500):
     response = requests.get(url, timeout=15)
     response.encoding = response.apparent_encoding
     soup = BeautifulSoup(response.text, 'html.parser')
@@ -75,7 +72,7 @@ def fetch_and_check_aozora(url, chunk_size=4000):
 # 3. オープニングクレジット作成（タイトル＆作者名）
 # ==========================================
 def get_japanese_font(work_dir, size):
-    font_path = os.path.join(BASE_CACHE_DIR, "NotoSansJP-Bold.ttf")
+    font_path = os.path.join(work_dir, "NotoSansJP-Bold.ttf")
     if not os.path.exists(font_path):
         domain = "raw.githubusercontent." + "com"
         font_url = f"https://{domain}/google/fonts/main/ofl/notosansjp/NotoSansJP%5Bwght%5D.ttf"
@@ -90,10 +87,8 @@ def get_japanese_font(work_dir, size):
 
 def create_title_clip(title, author, work_dir):
     video_path = os.path.join(work_dir, "part_000_title.mp4")
-    if os.path.exists(video_path) and os.path.getsize(video_path) > 5000:
-        return video_path
-
     img_path = os.path.join(work_dir, "opening_title.png")
+    
     width, height = 1280, 720
     img = PIL.Image.new("RGB", (width, height), color=(18, 20, 28))
     draw = PIL.ImageDraw.Draw(img)
@@ -127,38 +122,30 @@ def create_title_clip(title, author, work_dir):
     return video_path
 
 # ==========================================
-# 4. AI処理（設定資料・脚本・画像生成・リトライ強化）
+# 4. AI処理（設定資料・脚本・画像生成）
 # ==========================================
-def get_or_create_story_bible(client, title, sample_text, work_dir):
-    bible_path = os.path.join(work_dir, "bible.txt")
-    if os.path.exists(bible_path):
-        with open(bible_path, "r", encoding="utf-8") as f:
-            return f.read()
-
+def create_story_bible(client, title, sample_text):
     prompt = f"""
 あなたはアニメ監督です。これから小説『{title}』を2Dアニメ動画化します。
-作品名と冒頭テキストをもとに、全編を通してイラストの時代考証やキャラクターの見た目がブレないようにするための「英語の設定資料（ビジュアルガイド）」を150単語以内で作成してください。
+作品名と冒頭テキストをもとに、全編を通してイラストの時代考証やキャラクターの見た目がブレないようにするための「英語の設定資料（ビジュアルガイド）」を120単語以内で作成してください。
 1. Era & Setting: 時代背景、国、建築様式、服装の特徴
-2. Main Characters Visuals: 登場人物の髪色・服装・年齢感・動物の見た目などの固定特徴
+2. Main Characters Visuals: 登場人物の髪色・服装・年齢感などの固定特徴
 
 作品名: {title}
 冒頭テキスト:
-{sample_text[:3000]}
+{sample_text[:2500]}
 """
-    for attempt in range(8):
+    for attempt in range(5):
         try:
             response = client.models.generate_content(model="gemini-3.8-flash", contents=prompt)
-            bible = response.text.strip()
-            with open(bible_path, "w", encoding="utf-8") as f:
-                f.write(bible)
-            return bible
+            return response.text.strip()
         except Exception:
-            time.sleep(5 * (attempt + 1))
+            time.sleep(5)
     return f"Story: {title}, classic literature setting."
 
 def generate_script(client, text_chunk, title, story_bible, prev_summary):
     prompt = f"""
-あなたは優秀なアニメ監督兼脚本家です。以下の【作品設定資料】と【直前までのあらすじ】を守りながら、今回の【対象テキスト】を令和の自然な口語体に翻訳・再構成し、動画用の脚本（4〜6シーン程度）をJSON形式で作成してください。
+あなたは優秀なアニメ監督兼脚本家です。以下の【作品設定資料】と【直前までのあらすじ】を守りながら、今回の【対象テキスト】を令和の自然な口語体に翻訳・再構成し、動画用の脚本（3〜4シーン）をJSON形式で作成してください。
 
 【作品名】{title}
 【作品設定資料】{story_bible}
@@ -181,7 +168,7 @@ def generate_script(client, text_chunk, title, story_bible, prev_summary):
 【対象テキスト】
 {text_chunk}
 """
-    for attempt in range(8):
+    for attempt in range(5):
         try:
             response = client.models.generate_content(model="gemini-3.8-flash", contents=prompt)
             raw_text = response.text.strip()
@@ -189,13 +176,10 @@ def generate_script(client, text_chunk, title, story_bible, prev_summary):
             raw_text = re.sub(r'\s*```$', '', raw_text)
             return json.loads(raw_text)
         except Exception:
-            time.sleep(5 * (attempt + 1))
-    raise RuntimeError("AIサーバーの混雑が続いており、脚本を作成できませんでした。")
+            time.sleep(8)
+    raise RuntimeError("AIサーバーが混雑しています。少し時間を置いてから再度お試しください。")
 
 def generate_image_cloudflare(cf_id, cf_token, scene_description, save_path):
-    if os.path.exists(save_path) and os.path.getsize(save_path) > 1000:
-        return
-
     model_name = "@cf/black-forest-labs/flux-1-schnell"
     domain = "api." + "cloudflare." + "com"
     url = f"https://{domain}/client/v4/accounts/{cf_id}/ai/run/{model_name}"
@@ -204,7 +188,7 @@ def generate_image_cloudflare(cf_id, cf_token, scene_description, save_path):
     full_prompt = f"{scene_description}, 2D anime illustration style, clean lineart, flat cel shading, light novel illustration, soft lighting"
     payload = {"prompt": full_prompt, "steps": 4}
     
-    for attempt in range(5):
+    for attempt in range(4):
         response = requests.post(url, headers=headers, json=payload, timeout=60)
         if response.status_code == 200:
             image_base64 = response.json()["result"]["image"]
@@ -225,25 +209,21 @@ def generate_image_cloudflare(cf_id, cf_token, scene_description, save_path):
         elif response.status_code == 429 or "limit" in response.text.lower():
             raise RuntimeError("本日の無料画像生成上限に達しました。明日またお試しください！")
         else:
-            # 一時的なサーバー混雑時は待機して自動リトライ
-            time.sleep(5 * (attempt + 1))
-            
+            time.sleep(5)
     raise RuntimeError("画像サーバーの混雑が解消されませんでした。")
 
-def create_part_video(cf_id, cf_token, scenes, part_num, total_parts, work_dir, update_status):
+def create_part_video(cf_id, cf_token, scenes, part_num, total_parts, work_dir, status_box, progress_bar):
     part_video_path = os.path.join(work_dir, f"part_{part_num:03d}.mp4")
-    if os.path.exists(part_video_path) and os.path.getsize(part_video_path) > 10000:
-        return part_video_path
-
     clips = []
+    
     for idx, scene in enumerate(scenes):
-        progress_val = ((part_num - 1) + (idx / len(scenes))) / total_parts
-        update_status("running", f"🎨 パート {part_num}/{total_parts} - シーン {idx+1}/{len(scenes)} の音声と2Dイラストを生成中...", progress_val)
+        prog = ((part_num - 1) + (idx / len(scenes))) / total_parts
+        progress_bar.progress(min(max(prog, 0.05), 0.95))
+        status_box.info(f"🎨 パート {part_num}/{total_parts} - シーン {idx+1}/{len(scenes)} の音声と2Dイラストを生成中...")
         
         audio_path = os.path.join(work_dir, f"p{part_num}_s{idx+1}.mp3")
-        if not os.path.exists(audio_path):
-            tts = gTTS(text=scene['narration'], lang='ja')
-            tts.save(audio_path)
+        tts = gTTS(text=scene['narration'], lang='ja')
+        tts.save(audio_path)
         
         image_path = os.path.join(work_dir, f"p{part_num}_s{idx+1}.png")
         generate_image_cloudflare(cf_id, cf_token, scene['image_prompt'], image_path)
@@ -263,7 +243,6 @@ def create_part_video(cf_id, cf_token, scenes, part_num, total_parts, work_dir, 
         video_clip = VideoClip(make_frame, duration=audio_clip.duration).set_audio(audio_clip)
         clips.append(video_clip)
         
-    update_status("running", f"💾 パート {part_num}/{total_parts} の動画データを保存中...", part_num / total_parts)
     part_video = concatenate_videoclips(clips, method="compose")
     part_video.write_videofile(part_video_path, fps=24, codec="libx264", audio_codec="aac", logger=None)
     
@@ -285,172 +264,85 @@ def merge_videos_fast(chapter_files, output_path, work_dir):
     subprocess.run(cmd, check=True)
 
 # ==========================================
-# 5. バックグラウンド自動完走ワーカー（画面を閉じても裏で動き続ける）
-# ==========================================
-def background_worker(url, work_dir, status_file):
-    def update_status(state, message, progress=0.0, output_file="", title="", author=""):
-        data = {
-            "state": state,
-            "message": message,
-            "progress": progress,
-            "output_file": output_file,
-            "title": title,
-            "author": author,
-            "updated_at": time.time()
-        }
-        with open(status_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        update_status("running", "📖 青空文庫からテキストを取得・解析中...", 0.02)
-        title, author, safe_title, full_text, chunks = fetch_and_check_aozora(url, chunk_size=4000)
-        
-        output_filename = f"{safe_title}_2Dアニメ.mp4"
-        final_output_path = os.path.join(work_dir, output_filename)
-        
-        # すでに全編完成済みの場合は即完了にする
-        if os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 10000:
-            update_status("done", f"🎉 完成済みです！『{title}』", 1.0, final_output_path, title, author)
-            return
-
-        update_status("running", "🎬 オープニングタイトル画面を作成中...", 0.05, "", title, author)
-        title_video = create_title_clip(title, author, work_dir)
-        chapter_files = [title_video]
-        
-        update_status("running", "📚 作品の世界観・キャラクター設定資料を作成中...", 0.08, "", title, author)
-        story_bible = get_or_create_story_bible(client, title, full_text, work_dir)
-        
-        summary_path = os.path.join(work_dir, "last_summary.txt")
-        if os.path.exists(summary_path):
-            with open(summary_path, "r", encoding="utf-8") as f:
-                current_summary = f.read()
-        else:
-            current_summary = "物語の始まり。"
-            
-        total_parts = len(chunks)
-        for i in range(total_parts):
-            part_num = i + 1
-            part_video_path = os.path.join(work_dir, f"part_{part_num:03d}.mp4")
-            
-            # すでにこのパートが完成していればスキップ（途中再開）
-            if os.path.exists(part_video_path) and os.path.getsize(part_video_path) > 10000:
-                chapter_files.append(part_video_path)
-                update_status("running", f"⏭️ パート {part_num}/{total_parts} は作成済みのためスキップ...", part_num / total_parts, "", title, author)
-                continue
-                
-            update_status("running", f"🤖 パート {part_num}/{total_parts} の脚本をAIが執筆中...", (part_num - 0.8) / total_parts, "", title, author)
-            script_data = generate_script(client, chunks[i], title, story_bible, current_summary)
-            
-            summaries = [s.get('scene_summary', '') for s in script_data if s.get('scene_summary')]
-            if summaries:
-                current_summary = " / ".join(summaries[-3:])
-                with open(summary_path, "w", encoding="utf-8") as f:
-                    f.write(current_summary)
-                    
-            video_file = create_part_video(CF_ACCOUNT_ID, CF_API_TOKEN, script_data, part_num, total_parts, work_dir, update_status)
-            chapter_files.append(video_file)
-            
-        update_status("running", "🎬 タイトルと本編を結合して仕上げています...", 0.98, "", title, author)
-        merge_videos_fast(chapter_files, final_output_path, work_dir)
-        
-        update_status("done", f"🎉 完成しました！『{title}』", 1.0, final_output_path, title, author)
-        
-    except ValueError as ve:
-        update_status("warning", str(ve))
-    except Exception as e:
-        update_status("error", f"エラーが発生しました（再度ボタンを押すと続きから再開できます）: {e}")
-
-# ==========================================
-# 6. Webアプリ画面（マルチデバイス・自動復帰UI）
+# 5. Webアプリ画面（UI）
 # ==========================================
 st.set_page_config(page_title="青空文庫 2Dアニメ自動生成メーカー", page_icon="🎬", layout="centered")
 
 st.title("🎬 青空文庫 2Dアニメ自動生成メーカー")
 st.markdown(f"""
-青空文庫の短編小説（**{MAX_CHARS:,}文字以下**）のURLを入力してください。  
-**バックグラウンド自動生成**に対応しているため、途中で画面を閉じたり、別のスマホ・PCから同じURLを開き直しても、裏側で作成を続けて結果を表示します。
+青空文庫の短編小説（**{MAX_CHARS:,}文字以下**）の本文URLを入力してボタンを押すと、約1〜2分で2Dアニメ動画が完成します。  
+※無料サーバーの仕様上、**動画が完成するまで（約1〜2分間）はこの画面を開いたまま**お待ちください。
 """)
 
 default_sample_url = "https://" + "www.aozora.gr.jp/cards/000879/files/92_14545.html"
 target_url = st.text_input("📖 青空文庫の本文URL（XHTML版）", value=default_sample_url)
 
-# URLごとに一意の作業フォルダを決定
-clean_url = target_url.strip()
-url_hash = hashlib.md5(clean_url.encode("utf-8")).hexdigest()[:12]
-work_dir = os.path.join(BASE_CACHE_DIR, url_hash)
-os.makedirs(work_dir, exist_ok=True)
-status_file = os.path.join(work_dir, "status.json")
-
-# 現在のステータスを確認
-current_status = None
-if os.path.exists(status_file):
-    try:
-        with open(status_file, "r", encoding="utf-8") as f:
-            current_status = json.load(f)
-    except Exception:
-        current_status = None
-
-# 実行中が長時間（5分以上）更新されていない場合は通信途絶とみなして再開可能にする
-is_running = False
-if current_status and current_status.get("state") == "running":
-    if time.time() - current_status.get("updated_at", 0) < 300:
-        is_running = True
-
-if st.button("🚀 2Dアニメ動画を生成 / 進捗を確認する", type="primary", use_container_width=True):
+if st.button("🚀 2Dアニメ動画を生成する", type="primary", use_container_width=True):
     if not GEMINI_API_KEY or not CF_ACCOUNT_ID or not CF_API_TOKEN:
         st.error("APIキーが設定されていません。管理画面のSecretsを設定してください。")
         st.stop()
-    if not clean_url:
+        
+    if not target_url.strip():
         st.error("URLを入力してください。")
         st.stop()
         
-    if not is_running:
-        # 裏側でスレッドを起動して自動完走させる
-        t = threading.Thread(target=background_worker, args=(clean_url, work_dir, status_file), daemon=True)
-        t.start()
-        time.sleep(0.5)
-        st.rerun()
-
-# ステータスに応じた自動画面更新と結果表示
-if os.path.exists(status_file):
-    with open(status_file, "r", encoding="utf-8") as f:
-        status = json.load(f)
-        
-    state = status.get("state")
-    msg = status.get("message", "")
-    prog = float(status.get("progress", 0.0))
-    title = status.get("title", "")
-    author = status.get("author", "")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    progress_bar = st.progress(0)
+    status_box = st.empty()
     
-    if title:
-        author_disp = f"（作：{author}）" if author else ""
-        st.subheader(f"📖 『{title}』{author_disp}")
-        
-    if state == "running":
-        st.progress(min(max(prog, 0.0), 1.0))
-        st.info(f"{msg}\n\n※画面を閉じても裏側で生成は続きます。別のデバイスから同じURLを開いても進捗を確認できます。")
-        time.sleep(3)
-        st.rerun()
-        
-    elif state == "done":
-        st.progress(1.0)
-        st.success(msg)
-        out_path = status.get("output_file", "")
-        if out_path and os.path.exists(out_path):
-            with open(out_path, "rb") as f:
+    with tempfile.TemporaryDirectory() as work_dir:
+        try:
+            status_box.info("📖 青空文庫からテキストを取得し、文字数をチェック中...")
+            title, author, safe_title, full_text, chunks = fetch_and_check_aozora(target_url.strip(), chunk_size=7500)
+            
+            author_disp = f"（作：{author}）" if author else ""
+            st.success(f"✅ 受付完了：『{title}』{author_disp}（{len(full_text):,}文字 / 全 {len(chunks)} パート）")
+            
+            status_box.info("🎬 オープニングタイトル画面を作成中...")
+            title_video = create_title_clip(title, author, work_dir)
+            chapter_files = [title_video]
+            
+            status_box.info("📚 作品の世界観・キャラクター設定資料を作成中...")
+            story_bible = create_story_bible(client, title, full_text)
+            
+            current_summary = "物語の始まり。"
+            total_parts = len(chunks)
+            
+            for i in range(total_parts):
+                part_num = i + 1
+                status_box.info(f"🤖 パート {part_num}/{total_parts} の脚本をAIが執筆中...")
+                script_data = generate_script(client, chunks[i], title, story_bible, current_summary)
+                
+                summaries = [s.get('scene_summary', '') for s in script_data if s.get('scene_summary')]
+                if summaries:
+                    current_summary = " / ".join(summaries[-3:])
+                    
+                video_file = create_part_video(CF_ACCOUNT_ID, CF_API_TOKEN, script_data, part_num, total_parts, work_dir, status_box, progress_bar)
+                chapter_files.append(video_file)
+                
+            progress_bar.progress(0.98)
+            status_box.info("🎬 タイトルと本編を結合して仕上げています...")
+            output_filename = f"{safe_title}_2Dアニメ.mp4"
+            output_path = os.path.join(work_dir, output_filename)
+            merge_videos_fast(chapter_files, output_path, work_dir)
+            
+            with open(output_path, "rb") as f:
                 video_bytes = f.read()
+                
+            progress_bar.progress(1.0)
+            status_box.success(f"🎉 完成しました！『{title}』{author_disp}")
             st.video(video_bytes)
             st.download_button(
                 label="📥 完成したMP4動画をダウンロード",
                 data=video_bytes,
-                file_name=os.path.basename(out_path),
+                file_name=output_filename,
                 mime="video/mp4",
                 use_container_width=True
             )
             
-    elif state == "warning":
-        st.warning(f"⚠️ {msg}")
-        
-    elif state == "error":
-        st.error(f"❌ {msg}")
+        except ValueError as ve:
+            status_box.empty()
+            st.warning(f"⚠️ {ve}")
+        except Exception as e:
+            status_box.empty()
+            st.error(f"❌ エラーが発生しました: {e}")
