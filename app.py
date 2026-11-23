@@ -121,31 +121,54 @@ def create_title_clip(title, author, work_dir):
     return video_path
 
 # ==========================================
-# 4. Gemini REST API 直接呼び出し（SDKのハングアップ完全回避）
+# 4. Gemini REST API 直接呼び出し（有効モデル自動取得）
 # ==========================================
-def call_gemini_direct(api_key, prompt):
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest"]
+def detect_active_gemini_model(api_key):
     domain = "generativelanguage.googleapis." + "com"
-    last_err = ""
-    
-    for model in models:
-        url = f"https://{domain}/v1beta/models/{model}:generateContent?key={api_key}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}]
-        }
-        try:
-            res = requests.post(url, json=payload, timeout=30)
-            if res.status_code == 200:
-                data = res.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            else:
-                last_err = f"[{model} HTTP {res.status_code}] {res.text[:200]}"
-        except Exception as e:
-            last_err = f"[{model}] {str(e)}"
-            
-    raise RuntimeError(f"Gemini通信エラー: {last_err}")
+    list_url = f"https://{domain}/v1beta/models?key={api_key}"
+    res = requests.get(list_url, timeout=15)
+    if res.status_code != 200:
+        raise RuntimeError(f"APIキー認証エラー ({res.status_code}): {res.text[:250]}")
+        
+    models_data = res.json().get("models", [])
+    valid_models = []
+    for m in models_data:
+        name = m.get("name", "")
+        methods = m.get("supportedGenerationMethods", [])
+        if "generateContent" in methods and "gemini" in name.lower():
+            if not any(x in name.lower() for x in ["embedding", "imagen", "veo", "aqa", "tts", "audio", "robotics"]):
+                valid_models.append(name)
+                
+    if not valid_models:
+        raise RuntimeError("このAPIキーで利用可能なGeminiモデルが見つかりませんでした。")
+        
+    # flash系を最優先で1つだけ選ぶ
+    for m in valid_models:
+        if "flash" in m.lower():
+            return m
+    return valid_models[0]
 
-def create_story_bible(api_key, title, sample_text):
+def call_gemini_direct(api_key, model_full_name, prompt):
+    domain = "generativelanguage.googleapis." + "com"
+    # model_full_name は "models/gemini-..." の形式
+    url = f"https://{domain}/v1beta/{model_full_name}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
+    
+    for attempt in range(3):
+        res = requests.post(url, json=payload, timeout=30)
+        if res.status_code == 200:
+            data = res.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        elif res.status_code == 429:
+            time.sleep(5)
+        else:
+            raise RuntimeError(f"[{model_full_name} HTTP {res.status_code}] {res.text[:250]}")
+            
+    raise RuntimeError(f"[{model_full_name}] 利用制限（429）により待機タイムアウトしました。")
+
+def create_story_bible(api_key, model_name, title, sample_text):
     prompt = f"""
 あなたはアニメ監督です。これから小説『{title}』を2Dアニメ動画化します。
 作品名と冒頭テキストをもとに、全編を通してイラストの時代考証やキャラクターの見た目がブレないようにするための「英語の設定資料（ビジュアルガイド）」を120単語以内で作成してください。
@@ -157,11 +180,11 @@ def create_story_bible(api_key, title, sample_text):
 {sample_text[:2500]}
 """
     try:
-        return call_gemini_direct(api_key, prompt)
+        return call_gemini_direct(api_key, model_name, prompt)
     except Exception:
         return f"Story: {title}, classic literature setting."
 
-def generate_script(api_key, text_chunk, title, story_bible, prev_summary):
+def generate_script(api_key, model_name, text_chunk, title, story_bible, prev_summary):
     prompt = f"""
 あなたは優秀なアニメ監督兼脚本家です。以下の【作品設定資料】と【直前までのあらすじ】を守りながら、今回の【対象テキスト】を令和の自然な口語体に翻訳・再構成し、動画用の脚本（3〜4シーン）をJSON形式で作成してください。
 
@@ -186,7 +209,7 @@ def generate_script(api_key, text_chunk, title, story_bible, prev_summary):
 【対象テキスト】
 {text_chunk}
 """
-    raw_text = call_gemini_direct(api_key, prompt)
+    raw_text = call_gemini_direct(api_key, model_name, prompt)
     raw_text = re.sub(r'^```json\s*', '', raw_text)
     raw_text = re.sub(r'\s*```$', '', raw_text)
     return json.loads(raw_text)
@@ -321,8 +344,11 @@ if st.button("🚀 2Dアニメ動画を生成する", type="primary", use_contai
             title_video = create_title_clip(title, author, work_dir)
             chapter_files = [title_video]
             
-            update_progress(20, "📚 作品の世界観・キャラクター設定資料を作成中...")
-            story_bible = create_story_bible(GEMINI_API_KEY, title, full_text)
+            update_progress(18, "🔍 利用可能な最新AIモデルを特定中...")
+            active_model = detect_active_gemini_model(GEMINI_API_KEY)
+            
+            update_progress(22, f"📚 世界観・キャラクター設定資料を作成中（使用AI: {active_model.replace('models/', '')}）...")
+            story_bible = create_story_bible(GEMINI_API_KEY, active_model, title, full_text)
             
             current_summary = "物語の始まり。"
             total_parts = len(chunks)
@@ -331,7 +357,7 @@ if st.button("🚀 2Dアニメ動画を生成する", type="primary", use_contai
                 part_num = i + 1
                 part_pct = 25 + int(65 * ((part_num - 1) / total_parts))
                 update_progress(part_pct, f"🤖 パート {part_num}/{total_parts} の脚本をAIが執筆中...")
-                script_data = generate_script(GEMINI_API_KEY, chunks[i], title, story_bible, current_summary)
+                script_data = generate_script(GEMINI_API_KEY, active_model, chunks[i], title, story_bible, current_summary)
                 
                 summaries = [s.get('scene_summary', '') for s in script_data if s.get('scene_summary')]
                 if summaries:
