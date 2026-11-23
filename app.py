@@ -137,7 +137,7 @@ def create_story_bible(client, title, sample_text):
 """
     for attempt in range(5):
         try:
-            response = client.models.generate_content(model="gemini-3.8-flash", contents=prompt)
+            response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
             return response.text.strip()
         except Exception:
             time.sleep(5)
@@ -170,7 +170,7 @@ def generate_script(client, text_chunk, title, story_bible, prev_summary):
 """
     for attempt in range(5):
         try:
-            response = client.models.generate_content(model="gemini-3.8-flash", contents=prompt)
+            response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
             raw_text = response.text.strip()
             raw_text = re.sub(r'^```json\s*', '', raw_text)
             raw_text = re.sub(r'\s*```$', '', raw_text)
