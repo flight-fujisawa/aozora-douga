@@ -17,6 +17,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from gtts import gTTS
 from google import genai
+from google.genai import types
 from moviepy.editor import ImageClip, AudioFileClip, AudioClip, VideoClip, concatenate_videoclips
 
 # ==========================================
@@ -122,22 +123,43 @@ def create_title_clip(title, author, work_dir):
     return video_path
 
 # ==========================================
-# 4. AI処理（複数モデル自動切替＆詳細エラー表示）
+# 4. AI処理（APIキーから有効モデルを自動取得して実行）
 # ==========================================
-def call_gemini_with_fallback(client, prompt):
-    models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-flash-latest"]
+def get_working_models(client):
+    available = []
+    try:
+        for m in client.models.list():
+            name = getattr(m, "name", "")
+            methods = getattr(m, "supported_generation_methods", []) or []
+            if "gemini" in name.lower() and ("generateContent" in methods or not methods):
+                clean_name = name.replace("models/", "")
+                if "embedding" not in clean_name and "imagen" not in clean_name and "veo" not in clean_name:
+                    available.append(clean_name)
+    except Exception:
+        pass
+    
+    # Flash系モデルを優先順位順に並べる
+    flash_models = [m for m in available if "flash" in m.lower()]
+    other_models = [m for m in available if "flash" not in m.lower()]
+    candidates = flash_models + other_models
+    
+    if not candidates:
+        candidates = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    return candidates
+
+def call_gemini_auto(client, prompt, candidate_models):
     last_error = ""
-    for model_name in models_to_try:
+    for model_name in candidate_models:
         try:
             response = client.models.generate_content(model=model_name, contents=prompt)
             if response and response.text:
                 return response.text.strip()
         except Exception as e:
             last_error = f"[{model_name}] {str(e)}"
-            time.sleep(2)
-    raise RuntimeError(f"Gemini APIエラー詳細: {last_error}")
+            time.sleep(1)
+    raise RuntimeError(f"利用可能なモデル一覧: {candidate_models[:5]} / エラー詳細: {last_error}")
 
-def create_story_bible(client, title, sample_text):
+def create_story_bible(client, title, sample_text, candidate_models):
     prompt = f"""
 あなたはアニメ監督です。これから小説『{title}』を2Dアニメ動画化します。
 作品名と冒頭テキストをもとに、全編を通してイラストの時代考証やキャラクターの見た目がブレないようにするための「英語の設定資料（ビジュアルガイド）」を120単語以内で作成してください。
@@ -149,11 +171,11 @@ def create_story_bible(client, title, sample_text):
 {sample_text[:2500]}
 """
     try:
-        return call_gemini_with_fallback(client, prompt)
+        return call_gemini_auto(client, prompt, candidate_models)
     except Exception:
         return f"Story: {title}, classic literature setting."
 
-def generate_script(client, text_chunk, title, story_bible, prev_summary):
+def generate_script(client, text_chunk, title, story_bible, prev_summary, candidate_models):
     prompt = f"""
 あなたは優秀なアニメ監督兼脚本家です。以下の【作品設定資料】と【直前までのあらすじ】を守りながら、今回の【対象テキスト】を令和の自然な口語体に翻訳・再構成し、動画用の脚本（3〜4シーン）をJSON形式で作成してください。
 
@@ -178,7 +200,7 @@ def generate_script(client, text_chunk, title, story_bible, prev_summary):
 【対象テキスト】
 {text_chunk}
 """
-    raw_text = call_gemini_with_fallback(client, prompt)
+    raw_text = call_gemini_auto(client, prompt, candidate_models)
     raw_text = re.sub(r'^```json\s*', '', raw_text)
     raw_text = re.sub(r'\s*```$', '', raw_text)
     return json.loads(raw_text)
@@ -293,7 +315,8 @@ if st.button("🚀 2Dアニメ動画を生成する", type="primary", use_contai
         st.error("URLを入力してください。")
         st.stop()
         
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    # v1betaエンドポイントを明示して最新のGeminiモデルを確実に使えるようにする
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(api_version='v1beta'))
     
     progress_bar = st.progress(0, text="準備中... (0%)")
     status_box = st.empty()
@@ -315,8 +338,11 @@ if st.button("🚀 2Dアニメ動画を生成する", type="primary", use_contai
             title_video = create_title_clip(title, author, work_dir)
             chapter_files = [title_video]
             
-            update_progress(20, "📚 作品の世界観・キャラクター設定資料を作成中...")
-            story_bible = create_story_bible(client, title, full_text)
+            update_progress(18, "🔍 利用可能なAIモデルを確認中...")
+            candidate_models = get_working_models(client)
+            
+            update_progress(22, "📚 作品の世界観・キャラクター設定資料を作成中...")
+            story_bible = create_story_bible(client, title, full_text, candidate_models)
             
             current_summary = "物語の始まり。"
             total_parts = len(chunks)
@@ -325,7 +351,7 @@ if st.button("🚀 2Dアニメ動画を生成する", type="primary", use_contai
                 part_num = i + 1
                 part_pct = 25 + int(65 * ((part_num - 1) / total_parts))
                 update_progress(part_pct, f"🤖 パート {part_num}/{total_parts} の脚本をAIが執筆中...")
-                script_data = generate_script(client, chunks[i], title, story_bible, current_summary)
+                script_data = generate_script(client, chunks[i], title, story_bible, current_summary, candidate_models)
                 
                 summaries = [s.get('scene_summary', '') for s in script_data if s.get('scene_summary')]
                 if summaries:
