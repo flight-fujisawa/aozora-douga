@@ -23,9 +23,9 @@ from moviepy.editor import ImageClip, AudioFileClip, AudioClip, VideoClip, conca
 # 1. APIキーの安全な読み込み
 # ==========================================
 try:
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-    CF_ACCOUNT_ID = st.secrets["CF_ACCOUNT_ID"]
-    CF_API_TOKEN = st.secrets["CF_API_TOKEN"]
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"].strip()
+    CF_ACCOUNT_ID = st.secrets["CF_ACCOUNT_ID"].strip()
+    CF_API_TOKEN = st.secrets["CF_API_TOKEN"].strip()
 except Exception:
     GEMINI_API_KEY = ""
     CF_ACCOUNT_ID = ""
@@ -122,8 +122,21 @@ def create_title_clip(title, author, work_dir):
     return video_path
 
 # ==========================================
-# 4. AI処理（設定資料・脚本・画像生成）
+# 4. AI処理（複数モデル自動切替＆詳細エラー表示）
 # ==========================================
+def call_gemini_with_fallback(client, prompt):
+    models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-flash-latest"]
+    last_error = ""
+    for model_name in models_to_try:
+        try:
+            response = client.models.generate_content(model=model_name, contents=prompt)
+            if response and response.text:
+                return response.text.strip()
+        except Exception as e:
+            last_error = f"[{model_name}] {str(e)}"
+            time.sleep(2)
+    raise RuntimeError(f"Gemini APIエラー詳細: {last_error}")
+
 def create_story_bible(client, title, sample_text):
     prompt = f"""
 あなたはアニメ監督です。これから小説『{title}』を2Dアニメ動画化します。
@@ -135,13 +148,10 @@ def create_story_bible(client, title, sample_text):
 冒頭テキスト:
 {sample_text[:2500]}
 """
-    for attempt in range(5):
-        try:
-            response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-            return response.text.strip()
-        except Exception:
-            time.sleep(5)
-    return f"Story: {title}, classic literature setting."
+    try:
+        return call_gemini_with_fallback(client, prompt)
+    except Exception:
+        return f"Story: {title}, classic literature setting."
 
 def generate_script(client, text_chunk, title, story_bible, prev_summary):
     prompt = f"""
@@ -168,16 +178,10 @@ def generate_script(client, text_chunk, title, story_bible, prev_summary):
 【対象テキスト】
 {text_chunk}
 """
-    for attempt in range(5):
-        try:
-            response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-            raw_text = response.text.strip()
-            raw_text = re.sub(r'^```json\s*', '', raw_text)
-            raw_text = re.sub(r'\s*```$', '', raw_text)
-            return json.loads(raw_text)
-        except Exception:
-            time.sleep(8)
-    raise RuntimeError("AIサーバーが混雑しています。少し時間を置いてから再度お試しください。")
+    raw_text = call_gemini_with_fallback(client, prompt)
+    raw_text = re.sub(r'^```json\s*', '', raw_text)
+    raw_text = re.sub(r'\s*```$', '', raw_text)
+    return json.loads(raw_text)
 
 def generate_image_cloudflare(cf_id, cf_token, scene_description, save_path):
     model_name = "@cf/black-forest-labs/flux-1-schnell"
@@ -210,7 +214,7 @@ def generate_image_cloudflare(cf_id, cf_token, scene_description, save_path):
             raise RuntimeError("本日の無料画像生成上限に達しました。明日またお試しください！")
         else:
             time.sleep(5)
-    raise RuntimeError("画像サーバーの混雑が解消されませんでした。")
+    raise RuntimeError(f"Cloudflare画像エラー ({response.status_code}): {response.text[:200]}")
 
 def create_part_video(cf_id, cf_token, scenes, part_num, total_parts, work_dir, update_progress):
     part_video_path = os.path.join(work_dir, f"part_{part_num:03d}.mp4")
@@ -356,4 +360,4 @@ if st.button("🚀 2Dアニメ動画を生成する", type="primary", use_contai
         except Exception as e:
             progress_bar.empty()
             status_box.empty()
-            st.error(f"❌ エラーが発生しました: {e}")
+            st.error(f"❌ {e}")
